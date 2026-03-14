@@ -1210,17 +1210,18 @@ def serve_share_page(token):
         cursor.execute('SELECT id FROM shares WHERE token = ?', (token,))
         share = cursor.fetchone()
     except Exception as e:
-        print(f"DEBUG: Database error in serve_share_page: {e}")
+        log_error(f"DEBUG: Database error in serve_share_page: {e}")
         share = None
     finally:
         cursor.close()
         conn.close()
     
     if share:
+        log_error(f"SERVING SHARE PAGE FOR: {token}")
         return send_from_directory(app.static_folder, 'share.html')
     
+    log_error(f"SHARE TOKEN NOT FOUND IN DB: {token}")
     # If it's a 12-char token but not in DB, show a dedicated error or share page
-    # Instead of index.html, let's show share.html which will then handle the 404 nicely via API
     return send_from_directory(app.static_folder, 'share.html')
 
 # SHARING ROUTES
@@ -1473,7 +1474,8 @@ def delete_share(current_user_id, share_id):
 @app.route('/api/shares/download/<token>', methods=['GET', 'POST'])
 def download_shared_file(token):
     """Download a shared file"""
-    log_error(f"DOWNLOAD REQUEST: Token={token}, Method={request.method}")
+    log_error(f"--- SHARE DOWNLOAD START ---")
+    log_error(f"Token: {token} | Method: {request.method} | Args: {request.args.to_dict()}")
     password = None
     if request.method == 'POST':
         try:
@@ -1577,18 +1579,32 @@ def download_shared_file(token):
         
         log_error(f"FILE FOUND: {actual_path}")
         
-        # Update access count
-        cursor.execute('UPDATE shares SET access_count = access_count + 1 WHERE token = ?', (token,))
-        conn.commit()
+        # Update access count - Only on initial request (not Range requests)
+        # This prevents SQLite database locking during multi-connection video streaming
+        if not request.headers.get('Range'):
+            try:
+                cursor.execute('UPDATE shares SET access_count = access_count + 1 WHERE token = ?', (token,))
+                conn.commit()
+                log_error("DEBUG: Access count updated (Initial Request)")
+            except Exception as e:
+                log_error("DEBUG: Failed to update access count", e)
+        else:
+            log_error("DEBUG: Skipping access count update for Range request")
         
         # Check if it's a preview request
         is_preview = request.args.get('preview') == 'true'
+        log_error(f"DEBUG: is_preview={is_preview} | is_encrypted={is_encrypted}")
         
         if is_encrypted and iv_base64:
-            iv = base64.b64decode(iv_base64)
-            # Use is_preview to determine if it should be an attachment
-            return stream_decrypted_file(actual_path, app.config['ENCRYPTION_KEY'], iv, original_filename, file_type, file_size, as_attachment=not is_preview)
+            try:
+                iv = base64.b64decode(iv_base64)
+                log_error(f"DEBUG: STREAMING ENCRYPTED SHARE: {original_filename}")
+                return stream_decrypted_file(actual_path, app.config['ENCRYPTION_KEY'], iv, original_filename, file_type, file_size, as_attachment=not is_preview)
+            except Exception as e:
+                log_error("DEBUG: Decryption setup failed", e)
+                return jsonify({'message': 'Decryption failure'}), 500
         
+        log_error(f"DEBUG: STREAMING PLAIN SHARE: {original_filename}")
         try:
             return send_file(
                 actual_path,
@@ -1598,8 +1614,8 @@ def download_shared_file(token):
                 conditional=True
             )
         except Exception as e:
-            log_error(f"Shared send_file failed for {actual_path}", e)
-            return jsonify({'message': f'Cannot serve file: {str(e)}'}), 500
+            log_error(f"DEBUG: send_file failed", e)
+            return jsonify({'message': f'Server error: {str(e)}'}), 500
     except Exception as e:
         log_error("Shared download exception", e)
         return jsonify({'message': f'Download failed: {str(e)}'}), 500
