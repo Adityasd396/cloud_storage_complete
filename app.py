@@ -1058,6 +1058,21 @@ def stream_decrypted_file(path, key, iv, filename, mimetype, total_size, as_atta
     
     log_error(f"STREAM DOCTOR: {'(RANGE) ' if range_header else ''}{filename} | Status: {status_code} | Range: {start}-{end}/{total_size} | MIME: {mimetype}")
     
+    # Pre-flight check: Verify file exists and is readable before returning response
+    if not os.path.exists(path):
+        log_error(f"STREAM DOCTOR PRE-FLIGHT FAIL: File missing at {path}")
+        return jsonify({'message': 'File not found on disk'}), 404
+        
+    try:
+        with open(path, 'rb') as test_f:
+            test_f.seek(start)
+            if not test_f.read(1) and content_length > 0:
+                log_error(f"STREAM DOCTOR PRE-FLIGHT FAIL: Cannot read byte at {start}")
+                return jsonify({'message': 'File unreadable'}), 500
+    except Exception as e:
+        log_error(f"STREAM DOCTOR PRE-FLIGHT ERROR: {e}")
+        return jsonify({'message': f'File access error: {str(e)}'}), 500
+
     def generate():
         try:
             with open(path, 'rb') as f:
@@ -1116,10 +1131,13 @@ def stream_decrypted_file(path, key, iv, filename, mimetype, total_size, as_atta
     if range_header:
         response.headers['Content-Range'] = f'bytes {start}-{end}/{total_size}'
     
-    disposition = "attachment" if as_attachment else "inline"
-    # Clean filename for headers
-    safe_filename = filename.encode('ascii', 'ignore').decode('ascii')
-    response.headers['Content-Disposition'] = f'{disposition}; filename="{safe_filename}"'
+    if as_attachment:
+        # Clean filename for headers
+        safe_filename = filename.encode('ascii', 'ignore').decode('ascii')
+        response.headers['Content-Disposition'] = f'attachment; filename="{safe_filename}"'
+    else:
+        # For inline streaming (video/audio), some browsers prefer no disposition or just 'inline'
+        response.headers['Content-Disposition'] = 'inline'
     
     # Security and Performance Headers
     response.headers['X-Content-Type-Options'] = 'nosniff'
@@ -1520,15 +1538,16 @@ def download_shared_file(token):
         
         log_error(f"FILE INFO: Path={file_path_db}, StoredName={stored_filename}, OwnerID={owner_user_id}")
         
-        # Robust path resolution
+        # Robust path resolution - handles Windows/Linux mismatches
+        # Convert stored path to use current OS separators
+        normalized_db_path = file_path_db.replace('\\', os.sep).replace('/', os.sep)
+        
         potential_paths = [
-            file_path_db,
+            normalized_db_path,
             os.path.join(app.config['UPLOAD_FOLDER'], str(owner_user_id), stored_filename),
             os.path.join(app.config['UPLOAD_FOLDER'], stored_filename),
-            os.path.abspath(file_path_db) if not os.path.isabs(file_path_db) else None,
-            os.path.join(os.getcwd(), stored_filename),
-            os.path.join(os.getcwd(), 'uploads', stored_filename),
-            os.path.join(os.path.dirname(os.path.abspath(__file__)), 'uploads', stored_filename),
+            os.path.abspath(normalized_db_path) if not os.path.isabs(normalized_db_path) else None,
+            os.path.join(os.getcwd(), 'uploads', str(owner_user_id), stored_filename),
             os.path.join(os.path.dirname(os.path.abspath(__file__)), 'uploads', str(owner_user_id), stored_filename)
         ]
         
