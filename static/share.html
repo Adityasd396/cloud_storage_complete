@@ -1,0 +1,196 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Shared File - Cloud Storage</title>
+    <link rel="stylesheet" href="/css/styles.css">
+    <style>
+        .share-page {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            min-height: 100vh;
+            padding: 20px;
+            background-color: var(--bg);
+        }
+        .share-card {
+            background: white;
+            border-radius: 12px;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.08);
+            width: 100%;
+            max-width: 800px;
+            padding: 30px;
+            text-align: center;
+        }
+        .file-preview-container {
+            margin: 20px 0;
+            background: #f8f9fa;
+            border-radius: 8px;
+            padding: 20px;
+            min-height: 200px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            overflow: hidden;
+        }
+        .file-meta-info {
+            text-align: left;
+            margin: 20px 0;
+            padding: 15px;
+            background: #f8f9fa;
+            border-radius: 8px;
+            border-left: 4px solid var(--primary);
+        }
+        .file-meta-row {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 8px;
+            font-size: 14px;
+        }
+        .file-meta-label {
+            color: var(--text-light);
+            font-weight: 500;
+        }
+        .file-meta-value {
+            color: var(--text-dark);
+            font-weight: 600;
+        }
+        .share-password-container {
+            max-width: 400px;
+            margin: 0 auto;
+        }
+        .preview-icon {
+            font-size: 80px;
+            margin-bottom: 15px;
+        }
+        .download-btn {
+            width: 100%;
+            padding: 15px;
+            font-size: 16px;
+            margin-top: 10px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 10px;
+        }
+        .countdown-timer {
+            font-weight: bold;
+            color: white;
+            background: rgba(0,0,0,0.2);
+            padding: 2px 8px;
+            border-radius: 4px;
+            display: none;
+        }
+
+        /* Mobile Optimisation */
+        @media (max-width: 600px) {
+            .share-page {
+                padding: 10px;
+            }
+            .share-card {
+                padding: 20px 15px;
+                border-radius: 8px;
+            }
+            .preview-icon {
+                font-size: 60px;
+            }
+            .file-preview-container {
+                min-height: 150px;
+                padding: 0;
+                background: black;
+            }
+            .file-preview-container img {
+                padding: 10px;
+            }
+            .file-preview-container video {
+                width: 100% !important;
+                height: auto !important;
+                max-height: none !important;
+            }
+            .file-meta-row {
+                flex-direction: column;
+                gap: 2px;
+                margin-bottom: 12px;
+            }
+            .file-meta-value {
+                text-align: left;
+            }
+            h2 {
+                font-size: 1.25rem;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="share-page">
+        <div class="share-card" id="shareCard">
+            <div id="loadingState">
+                <div class="loading-spinner" style="width: 40px; height: 40px; border-width: 4px; margin-bottom: 15px;"></div>
+                <p>Loading shared file...</p>
+            </div>
+
+            <div id="passwordSection" style="display: none;">
+                <div class="preview-icon">🔒</div>
+                <h2>Password Protected</h2>
+                <p>This file is protected by a password.</p>
+                <div class="share-password-container">
+                    <div class="form-group" style="margin-top: 20px;">
+                        <input type="password" id="sharePasswordInput" placeholder="Enter password">
+                    </div>
+                    <button class="btn btn-primary" onclick="verifyPassword()">Unlock File</button>
+                </div>
+            </div>
+
+            <div id="contentSection" style="display: none;">
+                <h2 id="fileName" style="word-break: break-all;">File Name</h2>
+                
+                <div class="file-preview-container" id="previewContainer">
+                    <!-- Preview will be injected here -->
+                </div>
+
+                <div class="file-meta-info">
+                    <div class="file-meta-row">
+                        <span class="file-meta-label">Size</span>
+                        <span class="file-meta-value" id="fileSize">-</span>
+                    </div>
+                    <div class="file-meta-row">
+                        <span class="file-meta-label">Type</span>
+                        <span class="file-meta-value" id="fileType">-</span>
+                    </div>
+                    <div class="file-meta-row">
+                        <span class="file-meta-label">Uploaded At</span>
+                        <span class="file-meta-value" id="fileDate">-</span>
+                    </div>
+                    <div class="file-meta-row">
+                        <span class="file-meta-label">Expires</span>
+                        <span class="file-meta-value" id="fileExpires">-</span>
+                    </div>
+                </div>
+
+                <div style="margin-top: 30px;">
+                    <button class="btn btn-primary download-btn" id="downloadBtn" onclick="startDownloadCountdown()">
+                        <span id="downloadBtnText">⬇️ Download File</span>
+                        <span id="countdownDisplay" class="countdown-timer">15</span>
+                    </button>
+                </div>
+            </div>
+
+            <div id="errorSection" style="display: none;">
+                <div class="preview-icon">⚠️</div>
+                <h2 id="errorMessage">Link Invalid or Expired</h2>
+                <p>The shared link might be broken or has expired.</p>
+                <button class="btn btn-secondary" onclick="window.location.href='/'">Go to Home</button>
+            </div>
+        </div>
+        
+        <div style="margin-top: 20px; color: var(--text-light); font-size: 14px;">
+            Powered by Cloud Storage System
+        </div>
+    </div>
+
+    <script src="/js/config.js"></script>
+    <script src="/js/share_page.js"></script>
+</body>
+</html>
