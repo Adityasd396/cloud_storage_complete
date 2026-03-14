@@ -21,10 +21,11 @@ async function autoShareFile(fileId) {
             loadShares();
             loadStats();
         } else {
-            showNotification(data.message, 'error');
+            showNotification(data.message || 'Failed to create share link', 'error');
         }
     } catch (error) {
-        showNotification('Failed to create share link', 'error');
+        console.error('Auto-share error:', error);
+        showNotification('Failed to create share link: ' + error.message, 'error');
     }
 }
 
@@ -45,6 +46,11 @@ async function createShare() {
 
     if (expiry_hours < 1) {
         showNotification('Expiry must be at least 1 hour', 'error');
+        return;
+    }
+
+    if (!selectedFileId) {
+        showNotification('No file selected', 'error');
         return;
     }
 
@@ -70,10 +76,11 @@ async function createShare() {
             loadShares();
             loadStats();
         } else {
-            showNotification(data.message, 'error');
+            showNotification(data.message || 'Failed to create share link', 'error');
         }
     } catch (error) {
-        showNotification('Failed to create share link', 'error');
+        console.error('Share creation error:', error);
+        showNotification('Failed to create share link: ' + error.message, 'error');
     }
 }
 
