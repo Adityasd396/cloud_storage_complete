@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify, send_file, send_from_directory
+from flask import Flask, request, jsonify, send_file, send_from_directory, Response, stream_with_context
 from flask_cors import CORS
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.utils import secure_filename
@@ -13,6 +13,10 @@ import secrets
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.backends import default_backend
+import base64
+import mimetypes
 
 load_dotenv()
 
@@ -20,6 +24,49 @@ app = Flask(__name__, static_folder='static', static_url_path='')
 
 # Configuration
 app.config['SECRET_KEY'] = os.getenv('SECRET_KEY') or secrets.token_hex(32)
+# Encryption Master Key (Should be stored securely in .env)
+app.config['ENCRYPTION_KEY'] = os.getenv('ENCRYPTION_KEY') or secrets.token_bytes(32)
+if isinstance(app.config['ENCRYPTION_KEY'], str):
+    app.config['ENCRYPTION_KEY'] = app.config['ENCRYPTION_KEY'].encode()
+    if len(app.config['ENCRYPTION_KEY']) > 32:
+        app.config['ENCRYPTION_KEY'] = app.config['ENCRYPTION_KEY'][:32]
+    elif len(app.config['ENCRYPTION_KEY']) < 32:
+        app.config['ENCRYPTION_KEY'] = app.config['ENCRYPTION_KEY'].ljust(32, b'\0')
+
+# Constants for chunked encryption
+CHUNK_SIZE = 64 * 1024 # 64KB chunks
+IV_SIZE = 16
+
+def get_mimetype(filename):
+    """Accurately detect mimetype from filename"""
+    mtype, _ = mimetypes.guess_type(filename)
+    if not mtype:
+        # Fallback for common types if guess fails
+        ext = filename.split('.')[-1].lower()
+        fallbacks = {
+            'mp4': 'video/mp4',
+            'mkv': 'video/x-matroska',
+            'mov': 'video/quicktime',
+            'webm': 'video/webm',
+            'avi': 'video/x-msvideo',
+            'm4v': 'video/x-m4v',
+            'mp3': 'audio/mpeg',
+            'wav': 'audio/wav',
+            'ogg': 'audio/ogg'
+        }
+        return fallbacks.get(ext, 'application/octet-stream')
+    return mtype
+
+def encrypt_chunk(chunk, key, iv):
+    cipher = Cipher(algorithms.AES(key), modes.CTR(iv), backend=default_backend())
+    encryptor = cipher.encryptor()
+    return encryptor.update(chunk) + encryptor.finalize()
+
+def decrypt_chunk(chunk, key, iv):
+    cipher = Cipher(algorithms.AES(key), modes.CTR(iv), backend=default_backend())
+    decryptor = cipher.decryptor()
+    return decryptor.update(chunk) + decryptor.finalize()
+
 # Make upload folder absolute to prevent issues in production
 _upload_folder = os.getenv('UPLOAD_FOLDER', 'uploads')
 if not os.path.isabs(_upload_folder):
@@ -173,7 +220,7 @@ def init_database():
         ''')
         print("✓ Folders table created")
         
-        # Create files table with folder_id
+        # Create files table with encryption support
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS files (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -184,11 +231,22 @@ def init_database():
                 size INTEGER NOT NULL,
                 type TEXT,
                 path TEXT NOT NULL,
+                is_encrypted INTEGER DEFAULT 0,
+                iv TEXT,
                 uploaded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
                 FOREIGN KEY (folder_id) REFERENCES folders(id) ON DELETE SET NULL
             )
         ''')
+        
+        # Add columns if they don't exist (migration for existing DB)
+        try:
+            cursor.execute('ALTER TABLE files ADD COLUMN is_encrypted INTEGER DEFAULT 0')
+        except: pass
+        try:
+            cursor.execute('ALTER TABLE files ADD COLUMN iv TEXT')
+        except: pass
+        
         print("✓ Files table created")
         
         # Create shares table
@@ -446,7 +504,7 @@ def login():
             'user_id': user[0],
             'email': user[2],
             'is_admin': user[4],
-            'exp': datetime.datetime.utcnow() + datetime.timedelta(days=30)
+            'exp': datetime.datetime.utcnow() + datetime.timedelta(days=365)
         }, app.config['SECRET_KEY'], algorithm='HS256')
         
         response = jsonify({
@@ -460,14 +518,14 @@ def login():
             }
         })
         
-        # Set HttpOnly cookie for persistent login
+        # Set HttpOnly cookie for persistent login (1 year)
         response.set_cookie(
             'auth_token', 
             token, 
             httponly=True, 
             secure=False, # Set to True if using HTTPS
             samesite='Lax',
-            max_age=30 * 24 * 60 * 60 # 30 days
+            max_age=365 * 24 * 60 * 60 # 1 year
         )
         
         return response, 200
@@ -760,12 +818,48 @@ def upload_file(current_user_id):
         os.makedirs(user_folder, exist_ok=True)
         
         filepath = os.path.join(user_folder, stored_filename)
-        file.save(filepath)
-        file_size = os.path.getsize(filepath)
         
+        # Encryption Setup
+        iv = secrets.token_bytes(IV_SIZE)
+        iv_base64 = base64.b64encode(iv).decode()
+        
+        # Save file with encryption in chunks
+        file_size = 0
+        with open(filepath, 'wb') as f:
+            while True:
+                chunk = file.read(CHUNK_SIZE)
+                if not chunk:
+                    break
+                encrypted_chunk = encrypt_chunk(chunk, app.config['ENCRYPTION_KEY'], iv)
+                # Since it's CTR mode, we need to update the IV or use a cipher object that maintains state
+                # Actually, AES-CTR cipher objects in cryptography maintain state. 
+                # Let's rewrite encrypt_chunk to be more efficient or use it correctly.
+                f.write(encrypted_chunk)
+                file_size += len(chunk)
+                
+                # Update IV for next chunk in CTR mode? 
+                # No, standard AES-CTR handles the counter internally if we keep the same encryptor.
+        
+        # Let's fix the encrypt_chunk logic to use a persistent encryptor for the whole file
+        # Rewriting the upload logic to use a persistent encryptor:
+        file.seek(0) # Reset file pointer
+        file_size = 0
+        cipher = Cipher(algorithms.AES(app.config['ENCRYPTION_KEY']), modes.CTR(iv), backend=default_backend())
+        encryptor = cipher.encryptor()
+        
+        with open(filepath, 'wb') as f:
+            while True:
+                chunk = file.read(CHUNK_SIZE)
+                if not chunk:
+                    break
+                encrypted_chunk = encryptor.update(chunk)
+                f.write(encrypted_chunk)
+                file_size += len(chunk)
+            f.write(encryptor.finalize())
+
         cursor.execute(
-            'INSERT INTO files (user_id, folder_id, filename, stored_filename, size, type, path) VALUES (?, ?, ?, ?, ?, ?, ?)',
-            (current_user_id, folder_id if folder_id else None, file.filename, stored_filename, file_size, file.content_type, filepath)
+            'INSERT INTO files (user_id, folder_id, filename, stored_filename, size, type, path, is_encrypted, iv) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            (current_user_id, folder_id if folder_id else None, file.filename, stored_filename, file_size, file.content_type, filepath, 1, iv_base64)
         )
         conn.commit()
         file_id = cursor.lastrowid
@@ -848,13 +942,13 @@ def list_files(current_user_id):
 @app.route('/api/files/<int:file_id>', methods=['GET'])
 @token_required
 def download_file(current_user_id, file_id):
-    """Download a file"""
+    """Download or preview a file"""
     conn = get_db_connection()
     cursor = conn.cursor()
     
     try:
         cursor.execute('''
-            SELECT stored_filename, filename, path, type 
+            SELECT stored_filename, filename, path, type, is_encrypted, iv, size 
             FROM files 
             WHERE id = ? AND user_id = ?
         ''', (file_id, current_user_id))
@@ -867,7 +961,14 @@ def download_file(current_user_id, file_id):
         stored_filename = file_info[0]
         original_filename = file_info[1]
         stored_path_db = file_info[2]
-        file_type = file_info[3] or 'application/octet-stream'
+        is_encrypted = bool(file_info[4])
+        iv_base64 = file_info[5]
+        file_size = file_info[6]
+        
+        # Professional MIME detection
+        file_type = get_mimetype(original_filename)
+        
+        is_preview = request.args.get('preview') == 'true'
         
         # Robust path resolution
         potential_paths = [
@@ -899,10 +1000,15 @@ def download_file(current_user_id, file_id):
             log_error(f"Download failed: File {stored_filename} NOT FOUND on server at any location")
             return jsonify({'message': 'File not found on server'}), 404
         
+        if is_encrypted and iv_base64:
+            iv = base64.b64decode(iv_base64)
+            # Logged in user download/preview
+            return stream_decrypted_file(actual_path, app.config['ENCRYPTION_KEY'], iv, original_filename, file_type, file_size, as_attachment=not is_preview)
+        
         try:
             return send_file(
                 actual_path,
-                as_attachment=True,
+                as_attachment=not is_preview,
                 download_name=original_filename,
                 mimetype=file_type,
                 conditional=True
@@ -917,6 +1023,98 @@ def download_file(current_user_id, file_id):
     finally:
         cursor.close()
         conn.close()
+
+def stream_decrypted_file(path, key, iv, filename, mimetype, total_size, as_attachment=True):
+    """Stream a decrypted file with professional-grade Range support"""
+    range_header = request.headers.get('Range', None)
+    
+    start = 0
+    end = total_size - 1
+    
+    if range_header:
+        # Standard Range parsing: bytes=start-end
+        try:
+            byte_range = range_header.replace('bytes=', '').split('-')
+            if byte_range[0]: start = int(byte_range[0])
+            if byte_range[1]: end = int(byte_range[1])
+        except Exception as e:
+            log_error(f"Range parsing error: {e}")
+        
+    # Boundary checks
+    start = max(0, start)
+    end = min(total_size - 1, end)
+    if start > end: start = end
+
+    content_length = end - start + 1
+    status_code = 206 if range_header else 200
+    
+    log_error(f"STREAMING {'(RANGE) ' if range_header else ''}{filename} | Status: {status_code} | Range: {start}-{end}/{total_size}")
+    
+    def generate():
+        try:
+            with open(path, 'rb') as f:
+                # Calculate counter offset for AES-CTR
+                iv_int = int.from_bytes(iv, byteorder='big')
+                # Block index (each block is 16 bytes)
+                block_index = start // 16
+                new_iv_int = (iv_int + block_index) & 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF
+                new_iv = new_iv_int.to_bytes(16, byteorder='big')
+                
+                cipher = Cipher(algorithms.AES(key), modes.CTR(new_iv), backend=default_backend())
+                decryptor = cipher.decryptor()
+                
+                # Seek to the start of the required block
+                f.seek(block_index * 16)
+                
+                # Skip within the first block if not aligned
+                skip_in_block = start % 16
+                remaining_to_send = content_length
+                
+                # First chunk might be partial
+                initial_read = min(CHUNK_SIZE, remaining_to_send + skip_in_block)
+                chunk = f.read(initial_read)
+                if not chunk: return
+                
+                decrypted = decryptor.update(chunk)
+                yield decrypted[skip_in_block:]
+                remaining_to_send -= (len(decrypted) - skip_in_block)
+                
+                # Stream remaining chunks
+                while remaining_to_send > 0:
+                    chunk = f.read(min(CHUNK_SIZE, remaining_to_send))
+                    if not chunk: break
+                    yield decryptor.update(chunk)
+                    remaining_to_send -= len(chunk)
+                
+                yield decryptor.finalize()
+        except Exception as e:
+            log_error(f"Generator failure for {filename}", e)
+
+    response = Response(
+        stream_with_context(generate()),
+        status_code,
+        mimetype=mimetype
+    )
+    
+    # Standard headers for production-grade streaming
+    response.headers['Accept-Ranges'] = 'bytes'
+    response.headers['Content-Length'] = str(content_length)
+    
+    if range_header:
+        response.headers['Content-Range'] = f'bytes {start}-{end}/{total_size}'
+    
+    disposition = "attachment" if as_attachment else "inline"
+    # Ensure filename is safe for headers
+    safe_filename = filename.encode('ascii', 'ignore').decode('ascii')
+    response.headers['Content-Disposition'] = f'{disposition}; filename="{safe_filename}"'
+    
+    # Prevent caching for streams
+    response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
+    response.headers['Pragma'] = 'no-cache'
+    response.headers['Expires'] = '0'
+    response.headers['X-Content-Type-Options'] = 'nosniff'
+    
+    return response
 
 @app.route('/api/files/<int:file_id>', methods=['DELETE'])
 @token_required
@@ -998,11 +1196,11 @@ def serve_share_page(token):
 @token_required
 def create_share(current_user_id):
     """Create a shareable link"""
-    data = request.get_json()
+    data = request.get_json(silent=True) or {}
     file_id = data.get('file_id')
     password = data.get('password', '')
-    # Default to 10 years (87600 hours)
-    expiry_hours = data.get('expiry_hours', 87600)
+    
+    log_error(f"CREATE SHARE REQUEST: UserID={current_user_id}, FileID={file_id}")
     
     if not file_id:
         return jsonify({'message': 'File ID is required'}), 400
@@ -1011,11 +1209,13 @@ def create_share(current_user_id):
     cursor = conn.cursor()
     
     try:
+        # Check if file exists and belongs to user
         cursor.execute('SELECT filename FROM files WHERE id = ? AND user_id = ?', 
                       (file_id, current_user_id))
         file_info = cursor.fetchone()
         
         if not file_info:
+            log_error(f"Create share failed: File {file_id} not found for user {current_user_id}")
             return jsonify({'message': 'File not found'}), 404
         
         # Check if a share link already exists for this file without a password
@@ -1027,34 +1227,46 @@ def create_share(current_user_id):
         existing_share = cursor.fetchone()
         
         if existing_share and not password:
-            exp_date = datetime.datetime.fromisoformat(existing_share[1])
-            if exp_date > datetime.datetime.now():
-                share_token = existing_share[0]
-                expires_at = exp_date
-                base_url = request.host_url.rstrip('/')
-                share_url = f"{base_url}/{share_token}"
-                return jsonify({
-                    'message': 'Using existing share link',
-                    'share': {
-                        'url': share_url,
-                        'token': share_token,
-                        'expires_at': expires_at.isoformat()
-                    }
-                }), 200
+            try:
+                exp_date = datetime.datetime.fromisoformat(existing_share[1])
+                if exp_date > datetime.datetime.now():
+                    share_token = existing_share[0]
+                    expires_at = exp_date
+                    base_url = request.host_url.rstrip('/')
+                    share_url = f"{base_url}/{share_token}"
+                    log_error(f"Using existing share link: {share_token}")
+                    return jsonify({
+                        'message': 'Using existing share link',
+                        'share': {
+                            'url': share_url,
+                            'token': share_token,
+                            'expires_at': expires_at.isoformat()
+                        }
+                    }), 200
+            except Exception as e:
+                log_error(f"Existing share date parse error: {e}")
 
-        # Generate a short token instead of JWT
+        # Generate a short token
         share_token = generate_short_token(12)
         
         # Ensure token uniqueness
-        while True:
+        max_retries = 10
+        retries = 0
+        while retries < max_retries:
             cursor.execute('SELECT id FROM shares WHERE token = ?', (share_token,))
             if not cursor.fetchone():
                 break
             share_token = generate_short_token(12)
+            retries += 1
+        
+        if retries >= max_retries:
+            log_error("Failed to generate unique share token after multiple attempts")
+            return jsonify({'message': 'Token generation failed'}), 500
         
         expires_at = datetime.datetime.now() + datetime.timedelta(days=365*10)
         password_hash = generate_password_hash(password) if password else None
         
+        log_error(f"Inserting share into DB: Token={share_token}")
         cursor.execute(
             'INSERT INTO shares (user_id, file_id, filename, token, password, expires_at) VALUES (?, ?, ?, ?, ?, ?)',
             (current_user_id, file_id, file_info[0], share_token, password_hash, expires_at.isoformat())
@@ -1064,6 +1276,7 @@ def create_share(current_user_id):
         base_url = request.host_url.rstrip('/')
         share_url = f"{base_url}/{share_token}"
         
+        log_error(f"Share link created successfully: {share_token}")
         return jsonify({
             'message': 'Share link created',
             'share': {
@@ -1073,10 +1286,14 @@ def create_share(current_user_id):
                 'expires_at': expires_at.isoformat()
             }
         }), 201
+    except sqlite3.Error as e:
+        conn.rollback()
+        log_error("Database error during share creation", e)
+        return jsonify({'message': f'Database error: {str(e)}'}), 500
     except Exception as e:
         conn.rollback()
-        print(f"Create share error: {e}")
-        return jsonify({'message': str(e)}), 500
+        log_error("Unexpected error during share creation", e)
+        return jsonify({'message': f'Server error: {str(e)}'}), 500
     finally:
         cursor.close()
         conn.close()
@@ -1269,7 +1486,7 @@ def download_shared_file(token):
                 log_error("Invalid password provided for shared file")
                 return jsonify({'message': 'Invalid password'}), 401
         
-        cursor.execute('SELECT path, filename, stored_filename, type, user_id FROM files WHERE id = ?', (file_id,))
+        cursor.execute('SELECT path, filename, stored_filename, type, user_id, is_encrypted, iv, size FROM files WHERE id = ?', (file_id,))
         file_info = cursor.fetchone()
         
         if not file_info:
@@ -1279,21 +1496,15 @@ def download_shared_file(token):
         file_path_db = file_info[0]
         original_filename = file_info[1]
         stored_filename = file_info[2]
-        file_type = file_info[3] or 'application/octet-stream'
         owner_user_id = file_info[4]
+        is_encrypted = bool(file_info[5])
+        iv_base64 = file_info[6]
+        file_size = file_info[7]
+        
+        # Professional MIME detection
+        file_type = get_mimetype(original_filename)
         
         log_error(f"FILE INFO: Path={file_path_db}, StoredName={stored_filename}, OwnerID={owner_user_id}")
-        
-        # Correct MIME type
-        if not file_info[3] or file_info[3] == 'application/octet-stream':
-            fname_lower = original_filename.lower()
-            if fname_lower.endswith('.mp4'): file_type = 'video/mp4'
-            elif fname_lower.endswith('.mkv'): file_type = 'video/x-matroska'
-            elif fname_lower.endswith('.mov'): file_type = 'video/quicktime'
-            elif fname_lower.endswith('.webm'): file_type = 'video/webm'
-            elif fname_lower.endswith(('.jpg', '.jpeg')): file_type = 'image/jpeg'
-            elif fname_lower.endswith('.png'): file_type = 'image/png'
-            elif fname_lower.endswith('.gif'): file_type = 'image/gif'
         
         # Robust path resolution
         potential_paths = [
@@ -1335,6 +1546,11 @@ def download_shared_file(token):
         
         # Check if it's a preview request
         is_preview = request.args.get('preview') == 'true'
+        
+        if is_encrypted and iv_base64:
+            iv = base64.b64decode(iv_base64)
+            # Use is_preview to determine if it should be an attachment
+            return stream_decrypted_file(actual_path, app.config['ENCRYPTION_KEY'], iv, original_filename, file_type, file_size, as_attachment=not is_preview)
         
         try:
             return send_file(
