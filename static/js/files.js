@@ -250,7 +250,7 @@ function openPreviewModal(fileId, filename, mimeType) {
     previewTitle.textContent = filename;
     
     const fileType = getFileType(filename);
-    const fileUrl = `${API_URL}/files/${fileId}`;
+    const fileUrl = `${API_URL}/files/${fileId}?preview=true`;
     
     // Create temporary token for preview (using existing auth)
     const authHeader = `Bearer ${token}`;
