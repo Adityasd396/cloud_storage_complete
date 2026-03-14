@@ -24,17 +24,22 @@ app = Flask(__name__, static_folder='static', static_url_path='')
 
 # Configuration
 app.config['SECRET_KEY'] = os.getenv('SECRET_KEY') or secrets.token_hex(32)
-# Encryption Master Key (Should be stored securely in .env)
-app.config['ENCRYPTION_KEY'] = os.getenv('ENCRYPTION_KEY') or secrets.token_bytes(32)
-if isinstance(app.config['ENCRYPTION_KEY'], str):
-    app.config['ENCRYPTION_KEY'] = app.config['ENCRYPTION_KEY'].encode()
-    if len(app.config['ENCRYPTION_KEY']) > 32:
-        app.config['ENCRYPTION_KEY'] = app.config['ENCRYPTION_KEY'][:32]
-    elif len(app.config['ENCRYPTION_KEY']) < 32:
-        app.config['ENCRYPTION_KEY'] = app.config['ENCRYPTION_KEY'].ljust(32, b'\0')
+
+# Encryption Master Key - CRITICAL for production
+# We use SECRET_KEY as a secondary fallback to ensure consistency across restarts if ENCRYPTION_KEY is missing
+_raw_key = os.getenv('ENCRYPTION_KEY') or os.getenv('SECRET_KEY')
+if not _raw_key:
+    # This should only happen on first run if no .env exists
+    log_error("CRITICAL: No ENCRYPTION_KEY found. Generating a random one. Files will be lost on restart!")
+    app.config['ENCRYPTION_KEY'] = secrets.token_bytes(32)
+else:
+    # Ensure key is exactly 32 bytes for AES-256
+    if isinstance(_raw_key, str):
+        _raw_key = _raw_key.encode()
+    app.config['ENCRYPTION_KEY'] = _raw_key.ljust(32, b'\0')[:32]
 
 # Constants for chunked encryption
-CHUNK_SIZE = 64 * 1024 # 64KB chunks
+CHUNK_SIZE = 128 * 1024 # Increased to 128KB for better production performance
 IV_SIZE = 16
 
 def get_mimetype(filename):
@@ -818,44 +823,35 @@ def upload_file(current_user_id):
         os.makedirs(user_folder, exist_ok=True)
         
         filepath = os.path.join(user_folder, stored_filename)
+        # Ensure filepath is absolute for DB storage
+        filepath = os.path.abspath(filepath)
+        
+        log_error(f"UPLOADING: {filename} to {filepath}")
         
         # Encryption Setup
         iv = secrets.token_bytes(IV_SIZE)
         iv_base64 = base64.b64encode(iv).decode()
         
-        # Save file with encryption in chunks
-        file_size = 0
-        with open(filepath, 'wb') as f:
-            while True:
-                chunk = file.read(CHUNK_SIZE)
-                if not chunk:
-                    break
-                encrypted_chunk = encrypt_chunk(chunk, app.config['ENCRYPTION_KEY'], iv)
-                # Since it's CTR mode, we need to update the IV or use a cipher object that maintains state
-                # Actually, AES-CTR cipher objects in cryptography maintain state. 
-                # Let's rewrite encrypt_chunk to be more efficient or use it correctly.
-                f.write(encrypted_chunk)
-                file_size += len(chunk)
-                
-                # Update IV for next chunk in CTR mode? 
-                # No, standard AES-CTR handles the counter internally if we keep the same encryptor.
-        
-        # Let's fix the encrypt_chunk logic to use a persistent encryptor for the whole file
-        # Rewriting the upload logic to use a persistent encryptor:
+        # Save file with encryption in chunks using a persistent encryptor
         file.seek(0) # Reset file pointer
         file_size = 0
         cipher = Cipher(algorithms.AES(app.config['ENCRYPTION_KEY']), modes.CTR(iv), backend=default_backend())
         encryptor = cipher.encryptor()
         
-        with open(filepath, 'wb') as f:
-            while True:
-                chunk = file.read(CHUNK_SIZE)
-                if not chunk:
-                    break
-                encrypted_chunk = encryptor.update(chunk)
-                f.write(encrypted_chunk)
-                file_size += len(chunk)
-            f.write(encryptor.finalize())
+        try:
+            with open(filepath, 'wb') as f:
+                while True:
+                    chunk = file.read(CHUNK_SIZE)
+                    if not chunk:
+                        break
+                    encrypted_chunk = encryptor.update(chunk)
+                    f.write(encrypted_chunk)
+                    file_size += len(chunk)
+                f.write(encryptor.finalize())
+            log_error(f"UPLOAD SUCCESS: {filepath} ({file_size} bytes)")
+        except Exception as e:
+            log_error(f"UPLOAD FAILED writing to disk: {filepath}", e)
+            raise e
 
         cursor.execute(
             'INSERT INTO files (user_id, folder_id, filename, stored_filename, size, type, path, is_encrypted, iv) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
@@ -982,18 +978,23 @@ def download_file(current_user_id, file_id):
         ]
         
         actual_path = None
-        for p in potential_paths:
+        log_error(f"FINDING FILE: {stored_filename}")
+        for i, p in enumerate(potential_paths):
             if p:
                 abs_p = os.path.abspath(p)
-                if os.path.exists(abs_p) and os.path.isfile(abs_p):
+                exists = os.path.exists(abs_p)
+                log_error(f"Path Check {i+1}: {abs_p} | Exists: {exists}")
+                if exists and os.path.isfile(abs_p):
                     actual_path = abs_p
                     break
         
         if not actual_path:
             # Recursive search as last resort
+            log_error(f"NOT FOUND in standard locations. Starting emergency recursive search in {app.config['UPLOAD_FOLDER']}...")
             for root, dirs, files in os.walk(app.config['UPLOAD_FOLDER']):
                 if stored_filename in files:
                     actual_path = os.path.join(root, stored_filename)
+                    log_error(f"EMERGENCY FIND: {actual_path}")
                     break
         
         if not actual_path:
@@ -1108,11 +1109,12 @@ def stream_decrypted_file(path, key, iv, filename, mimetype, total_size, as_atta
     safe_filename = filename.encode('ascii', 'ignore').decode('ascii')
     response.headers['Content-Disposition'] = f'{disposition}; filename="{safe_filename}"'
     
-    # Prevent caching for streams
+    # Prevent caching for streams and ensure Nginx doesn't buffer
     response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
     response.headers['Pragma'] = 'no-cache'
     response.headers['Expires'] = '0'
     response.headers['X-Content-Type-Options'] = 'nosniff'
+    response.headers['X-Accel-Buffering'] = 'no'
     
     return response
 
@@ -1519,19 +1521,23 @@ def download_shared_file(token):
         ]
         
         actual_path = None
-        for p in potential_paths:
+        log_error(f"FINDING SHARED FILE: {stored_filename}")
+        for i, p in enumerate(potential_paths):
             if p:
                 abs_p = os.path.abspath(p)
-                if os.path.exists(abs_p) and os.path.isfile(abs_p):
+                exists = os.path.exists(abs_p)
+                log_error(f"Path Check {i+1}: {abs_p} | Exists: {exists}")
+                if exists and os.path.isfile(abs_p):
                     actual_path = abs_p
                     break
         
         if not actual_path:
             # Recursive search as last resort
-            log_error(f"File not found in standard locations, starting recursive search for {stored_filename}")
+            log_error(f"NOT FOUND in standard locations. Starting emergency recursive search in {app.config['UPLOAD_FOLDER']}...")
             for root, dirs, files in os.walk(app.config['UPLOAD_FOLDER']):
                 if stored_filename in files:
                     actual_path = os.path.join(root, stored_filename)
+                    log_error(f"EMERGENCY FIND: {actual_path}")
                     break
         
         if not actual_path:
@@ -1991,9 +1997,18 @@ if __name__ == '__main__':
     print("="*50)
     
     if init_database():
-        log_error("Backend started successfully")
-        log_error(f"UPLOAD_FOLDER: {app.config['UPLOAD_FOLDER']}")
-        log_error(f"CWD: {os.getcwd()}")
+        # Path Doctor - Production Diagnostics
+        abs_root = os.path.dirname(os.path.abspath(__file__))
+        abs_uploads = os.path.abspath(app.config['UPLOAD_FOLDER'])
+        abs_db = os.path.abspath(DB_PATH)
+        
+        log_error("--- PATH DOCTOR ---")
+        log_error(f"APP ROOT: {abs_root}")
+        log_error(f"UPLOAD FOLDER: {abs_uploads}")
+        log_error(f"DATABASE: {abs_db}")
+        log_error(f"CURRENT WORKING DIR: {os.getcwd()}")
+        log_error(f"ENCRYPTION KEY STATUS: {'STABLE' if os.getenv('ENCRYPTION_KEY') else 'FALLBACK (Using Secret Key)'}")
+        log_error("-------------------")
         
         app.run(debug=True, host='0.0.0.0', port=5000)
     else:
