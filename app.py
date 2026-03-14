@@ -22,6 +22,22 @@ load_dotenv()
 
 app = Flask(__name__, static_folder='static', static_url_path='')
 
+def log_error(message, error=None):
+    """Log errors to a file for production debugging"""
+    timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    error_msg = f"[{timestamp}] {message}"
+    if error:
+        error_msg += f" | Error: {str(error)}"
+    print(error_msg) # Still print to console
+    try:
+        with open('app.log', 'a') as f:
+            f.write(error_msg + '\n')
+            if error and hasattr(error, '__traceback__'):
+                import traceback
+                traceback.print_report(file=f)
+    except:
+        pass # If we can't write to log file, just ignore
+
 # Configuration
 app.config['SECRET_KEY'] = os.getenv('SECRET_KEY') or secrets.token_hex(32)
 
@@ -79,22 +95,6 @@ if not os.path.isabs(_upload_folder):
 app.config['UPLOAD_FOLDER'] = _upload_folder
 app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024 * 1024  # 100GB max
 ALLOWED_EXTENSIONS = {'txt', 'pdf', 'png', 'jpg', 'jpeg', 'gif', 'doc', 'docx', 'xls', 'xlsx', 'zip', 'rar', 'mp4', 'mov', 'avi', 'mp3', 'wav', 'mkv', 'webm', 'm4v', 'ogg', 'mp3'}
-
-def log_error(message, error=None):
-    """Log errors to a file for production debugging"""
-    timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    error_msg = f"[{timestamp}] {message}"
-    if error:
-        error_msg += f" | Error: {str(error)}"
-    print(error_msg) # Still print to console
-    try:
-        with open('app.log', 'a') as f:
-            f.write(error_msg + '\n')
-            if error and hasattr(error, '__traceback__'):
-                import traceback
-                traceback.print_report(file=f)
-    except:
-        pass # If we can't write to log file, just ignore
 
 # Email Configuration
 EMAIL_HOST = os.getenv('EMAIL_HOST', 'smtp.gmail.com')
