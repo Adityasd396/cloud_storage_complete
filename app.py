@@ -1097,7 +1097,9 @@ def stream_decrypted_file(path, key, iv, filename, mimetype, total_size, as_atta
                 while remaining_to_send > 0:
                     read_len = min(CHUNK_SIZE, remaining_to_send + (skip_in_block if is_first_chunk else 0))
                     chunk = f.read(read_len)
-                    if not chunk: break
+                    if not chunk: 
+                        log_error(f"STREAM DOCTOR: Unexpected EOF for {filename}")
+                        break
                     
                     decrypted = decryptor.update(chunk)
                     
@@ -1112,10 +1114,18 @@ def stream_decrypted_file(path, key, iv, filename, mimetype, total_size, as_atta
                     if len(chunk_to_yield) > remaining_to_send:
                         chunk_to_yield = chunk_to_yield[:remaining_to_send]
                     
+                    if not chunk_to_yield:
+                        # Safety break to prevent infinite loop
+                        log_error(f"STREAM DOCTOR: Empty chunk to yield for {filename}")
+                        break
+                        
                     yield chunk_to_yield
                     remaining_to_send -= len(chunk_to_yield)
                 
-                yield decryptor.finalize()
+                # Finalize might return leftover bytes
+                final_chunk = decryptor.finalize()
+                if final_chunk and remaining_to_send > 0:
+                    yield final_chunk[:remaining_to_send]
         except Exception as e:
             log_error(f"STREAM DOCTOR ERROR for {filename}", e)
 
