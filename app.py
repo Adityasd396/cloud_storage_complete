@@ -1271,19 +1271,33 @@ def create_share(current_user_id):
         
         if existing_share and not password:
             try:
-                exp_date = datetime.datetime.fromisoformat(existing_share[1])
-                if exp_date > datetime.datetime.now():
+                if existing_share[1]:
+                    exp_date = datetime.datetime.fromisoformat(existing_share[1])
+                    if exp_date > datetime.datetime.now():
+                        share_token = existing_share[0]
+                        expires_at = exp_date
+                        base_url = request.host_url.rstrip('/')
+                        share_url = f"{base_url}/{share_token}"
+                        log_error(f"Using existing share link: {share_token}")
+                        return jsonify({
+                            'message': 'Using existing share link',
+                            'share': {
+                                'url': share_url,
+                                'token': share_token,
+                                'expires_at': expires_at.isoformat()
+                            }
+                        }), 200
+                else:
+                    # If expires_at is None, consider it permanent
                     share_token = existing_share[0]
-                    expires_at = exp_date
                     base_url = request.host_url.rstrip('/')
                     share_url = f"{base_url}/{share_token}"
-                    log_error(f"Using existing share link: {share_token}")
                     return jsonify({
                         'message': 'Using existing share link',
                         'share': {
                             'url': share_url,
                             'token': share_token,
-                            'expires_at': expires_at.isoformat()
+                            'expires_at': None
                         }
                     }), 200
             except Exception as e:
