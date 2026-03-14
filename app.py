@@ -1026,22 +1026,29 @@ def download_file(current_user_id, file_id):
         conn.close()
 
 def stream_decrypted_file(path, key, iv, filename, mimetype, total_size, as_attachment=True):
-    """Stream a decrypted file with professional-grade Range support"""
+    """Stream a decrypted file with professional-grade Range support and diagnostics"""
     range_header = request.headers.get('Range', None)
     
     start = 0
     end = total_size - 1
     
     if range_header:
-        # Standard Range parsing: bytes=start-end
+        # Robust Range parsing for browser compatibility
         try:
-            byte_range = range_header.replace('bytes=', '').split('-')
-            if byte_range[0]: start = int(byte_range[0])
-            if byte_range[1]: end = int(byte_range[1])
+            # Format: bytes=start-end or bytes=start- or bytes=-end
+            r = range_header.replace('bytes=', '').strip()
+            if r.startswith('-'):
+                # Handle "-500" (last 500 bytes)
+                start = max(0, total_size - int(r[1:]))
+            else:
+                parts = r.split('-')
+                if parts[0]: start = int(parts[0])
+                if len(parts) > 1 and parts[1]: 
+                    end = int(parts[1])
         except Exception as e:
-            log_error(f"Range parsing error: {e}")
+            log_error(f"Range parsing error for {filename}: {e} (Header: {range_header})")
         
-    # Boundary checks
+    # Boundary validation
     start = max(0, start)
     end = min(total_size - 1, end)
     if start > end: start = end
@@ -1049,14 +1056,13 @@ def stream_decrypted_file(path, key, iv, filename, mimetype, total_size, as_atta
     content_length = end - start + 1
     status_code = 206 if range_header else 200
     
-    log_error(f"STREAMING {'(RANGE) ' if range_header else ''}{filename} | Status: {status_code} | Range: {start}-{end}/{total_size}")
+    log_error(f"STREAM DOCTOR: {'(RANGE) ' if range_header else ''}{filename} | Status: {status_code} | Range: {start}-{end}/{total_size} | MIME: {mimetype}")
     
     def generate():
         try:
             with open(path, 'rb') as f:
-                # Calculate counter offset for AES-CTR
+                # Calculate counter offset for AES-CTR (16-byte blocks)
                 iv_int = int.from_bytes(iv, byteorder='big')
-                # Block index (each block is 16 bytes)
                 block_index = start // 16
                 new_iv_int = (iv_int + block_index) & 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF
                 new_iv = new_iv_int.to_bytes(16, byteorder='big')
@@ -1067,29 +1073,36 @@ def stream_decrypted_file(path, key, iv, filename, mimetype, total_size, as_atta
                 # Seek to the start of the required block
                 f.seek(block_index * 16)
                 
-                # Skip within the first block if not aligned
+                # Skip within the first block if the request isn't block-aligned
                 skip_in_block = start % 16
                 remaining_to_send = content_length
                 
-                # First chunk might be partial
-                initial_read = min(CHUNK_SIZE, remaining_to_send + skip_in_block)
-                chunk = f.read(initial_read)
-                if not chunk: return
-                
-                decrypted = decryptor.update(chunk)
-                yield decrypted[skip_in_block:]
-                remaining_to_send -= (len(decrypted) - skip_in_block)
-                
-                # Stream remaining chunks
+                # Stream in chunks
+                is_first_chunk = True
                 while remaining_to_send > 0:
-                    chunk = f.read(min(CHUNK_SIZE, remaining_to_send))
+                    read_len = min(CHUNK_SIZE, remaining_to_send + (skip_in_block if is_first_chunk else 0))
+                    chunk = f.read(read_len)
                     if not chunk: break
-                    yield decryptor.update(chunk)
-                    remaining_to_send -= len(chunk)
+                    
+                    decrypted = decryptor.update(chunk)
+                    
+                    if is_first_chunk:
+                        # Extract the requested part of the first block
+                        chunk_to_yield = decrypted[skip_in_block:]
+                        is_first_chunk = False
+                    else:
+                        chunk_to_yield = decrypted
+                    
+                    # Ensure we don't send more than the requested range
+                    if len(chunk_to_yield) > remaining_to_send:
+                        chunk_to_yield = chunk_to_yield[:remaining_to_send]
+                    
+                    yield chunk_to_yield
+                    remaining_to_send -= len(chunk_to_yield)
                 
                 yield decryptor.finalize()
         except Exception as e:
-            log_error(f"Generator failure for {filename}", e)
+            log_error(f"STREAM DOCTOR ERROR for {filename}", e)
 
     response = Response(
         stream_with_context(generate()),
@@ -1097,24 +1110,23 @@ def stream_decrypted_file(path, key, iv, filename, mimetype, total_size, as_atta
         mimetype=mimetype
     )
     
-    # Standard headers for production-grade streaming
+    # Production-grade headers
     response.headers['Accept-Ranges'] = 'bytes'
     response.headers['Content-Length'] = str(content_length)
-    
     if range_header:
         response.headers['Content-Range'] = f'bytes {start}-{end}/{total_size}'
     
     disposition = "attachment" if as_attachment else "inline"
-    # Ensure filename is safe for headers
+    # Clean filename for headers
     safe_filename = filename.encode('ascii', 'ignore').decode('ascii')
     response.headers['Content-Disposition'] = f'{disposition}; filename="{safe_filename}"'
     
-    # Prevent caching for streams and ensure Nginx doesn't buffer
+    # Security and Performance Headers
+    response.headers['X-Content-Type-Options'] = 'nosniff'
     response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
     response.headers['Pragma'] = 'no-cache'
     response.headers['Expires'] = '0'
-    response.headers['X-Content-Type-Options'] = 'nosniff'
-    response.headers['X-Accel-Buffering'] = 'no'
+    response.headers['X-Accel-Buffering'] = 'no' # Disable Nginx buffering for smooth streaming
     
     return response
 
