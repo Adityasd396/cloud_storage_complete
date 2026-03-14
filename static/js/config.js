@@ -166,11 +166,49 @@ function getFileType(filename) {
 }
 
 function copyToClipboard(text) {
-    navigator.clipboard.writeText(text).then(() => {
-        showNotification('Link copied to clipboard!', 'success');
-    }).catch(() => {
-        showNotification('Failed to copy link', 'error');
-    });
+    if (!text) return;
+    
+    // Check if the Clipboard API is available and in a secure context
+    if (navigator.clipboard && window.isSecureContext) {
+        navigator.clipboard.writeText(text).then(() => {
+            showNotification('Link copied to clipboard!', 'success');
+        }).catch(err => {
+            console.error('Clipboard API error:', err);
+            fallbackCopyTextToClipboard(text);
+        });
+    } else {
+        // Fallback for non-secure contexts (HTTP) or unsupported browsers
+        fallbackCopyTextToClipboard(text);
+    }
+}
+
+function fallbackCopyTextToClipboard(text) {
+    const textArea = document.createElement("textarea");
+    textArea.value = text;
+    
+    // Ensure the textarea is off-screen
+    textArea.style.position = "fixed";
+    textArea.style.left = "-9999px";
+    textArea.style.top = "0";
+    document.body.appendChild(textArea);
+    
+    textArea.focus();
+    textArea.select();
+    
+    try {
+        const successful = document.execCommand('copy');
+        if (successful) {
+            showNotification('Link copied to clipboard!', 'success');
+        } else {
+            showNotification('Failed to copy link. Please manually copy: ' + text, 'error');
+            console.error('execCommand copy was unsuccessful');
+        }
+    } catch (err) {
+        console.error('Fallback copy error:', err);
+        showNotification('Failed to copy link. Please manually copy: ' + text, 'error');
+    }
+    
+    document.body.removeChild(textArea);
 }
 
 // Close modal when clicking outside
